@@ -1,0 +1,184 @@
+const express = require("express");
+const router = express.Router();
+const fetch = require("node-fetch");
+const { getAll, getOne, run } = require("../db");
+
+// Helper: map integer fields to booleans for API response
+function mapCandidate(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    notice_flexible: row.notice_flexible === 1 ? true : row.notice_flexible === 0 ? false : null,
+    location_comfortable: row.location_comfortable === 1 ? true : row.location_comfortable === 0 ? false : null,
+    call_completed: row.call_completed === 1 ? true : row.call_completed === 0 ? false : null,
+    candidate_available: row.candidate_available === 1 ? true : row.candidate_available === 0 ? false : null,
+  };
+}
+
+// GET /api/candidates — all candidates ordered by created_at DESC
+router.get("/", async (req, res) => {
+  try {
+    const rows = await getAll("SELECT * FROM candidates ORDER BY created_at DESC");
+    res.json(rows.map(mapCandidate));
+  } catch (err) {
+    console.error("GET /api/candidates error:", err);
+    res.status(500).json({ error: "Failed to fetch candidates" });
+  }
+});
+
+// POST /api/candidates — add new candidate
+router.post("/", async (req, res) => {
+  const { name, phone, email } = req.body;
+
+  if (!name || !phone) {
+    return res.status(400).json({ error: "Name and phone are required" });
+  }
+
+  try {
+    const result = await run(
+      "INSERT INTO candidates (name, phone, email, status) VALUES (?, ?, ?, 'uploaded')",
+      [name.trim(), phone.trim(), email ? email.trim() : null]
+    );
+    const candidate = await getOne("SELECT * FROM candidates WHERE id = ?", [result.lastID]);
+    res.status(201).json(mapCandidate(candidate));
+  } catch (err) {
+    console.error("POST /api/candidates error:", err);
+    res.status(500).json({ error: "Failed to create candidate" });
+  }
+});
+
+// POST /api/candidates/:id/call — trigger Bolna call
+router.post("/:id/call", async (req, res) => {
+  const { id } = req.params;
+
+  // 1. Look up candidate
+  const candidate = await getOne("SELECT * FROM candidates WHERE id = ?", [id]);
+  if (!candidate) {
+    return res.status(404).json({ error: "Candidate not found" });
+  }
+
+  // 2. Update status to "calling" immediately
+  await run("UPDATE candidates SET status = 'calling' WHERE id = ?", [id]);
+
+  try {
+    // 3. Call Bolna API
+    const response = await fetch("https://api.bolna.ai/call", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.BOLNA_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        agent_id: process.env.BOLNA_AGENT_ID,
+        recipient_phone_number: candidate.phone,
+        user_data: {
+          candidate_name: candidate.name,
+        },
+      }),
+    });
+
+    const bolnaData = await response.json();
+    console.log("Bolna API full response:", JSON.stringify(bolnaData, null, 2));
+
+    if (!response.ok) {
+      console.error("❌ Bolna API returned error status:", response.status);
+      await run("UPDATE candidates SET status = 'uploaded' WHERE id = ?", [id]);
+      return res.status(502).json({
+        error: "Bolna API call failed",
+        details: bolnaData,
+      });
+    }
+
+    // Extract call ID — Bolna returns it as "execution_id"
+    const callId = bolnaData.execution_id
+                || bolnaData.call_id
+                || bolnaData.id
+                || null;
+
+    console.log("📌 callId extracted:", callId);
+
+    // Save callId + status to DB — awaited explicitly so it always completes
+    try {
+      await run(
+        "UPDATE candidates SET bolna_call_id = ?, status = ? WHERE id = ?",
+        [callId, "calling", candidate.id]
+      );
+    } catch (dbErr) {
+      console.error("❌ DB save failed:", dbErr);
+    }
+
+    // Verify it was saved
+    const updated = await getOne(
+      "SELECT id, name, bolna_call_id, status FROM candidates WHERE id = ?",
+      [candidate.id]
+    );
+    console.log("✅ Saved to DB:", JSON.stringify(updated));
+
+    return res.json({ success: true, call_id: callId, status: "calling" });
+  } catch (err) {
+    console.error("POST /api/candidates/:id/call error:", err);
+    // Revert status on error
+    await run("UPDATE candidates SET status = 'uploaded' WHERE id = ?", [id]).catch(() => {});
+    res.status(500).json({ error: "Failed to initiate call", details: err.message });
+  }
+});
+
+// Whitelist of fields that PATCH is allowed to update
+const PATCH_WHITELIST = new Set([
+  "name", "phone", "email",                          // profile (used by EditCandidateModal)
+  "status", "bolna_call_id",                         // call state
+  "years_of_experience", "recent_role", "skill_rating",
+  "notice_period", "notice_flexible", "expected_ctc",
+  "location_comfortable", "call_completed", "candidate_available",
+  "fit_score", "recommendation", "notes", "transcript", "screened_at",
+]);
+
+// PATCH /api/candidates/:id — PROBLEM 2: dynamic update for any whitelisted fields
+router.patch("/:id", async (req, res) => {
+  const { id } = req.params;
+
+  const candidate = await getOne("SELECT * FROM candidates WHERE id = ?", [id]);
+  if (!candidate) {
+    return res.status(404).json({ error: "Candidate not found" });
+  }
+
+  // Build SET clause dynamically from whitelisted keys in body
+  const fields = [];
+  const values = [];
+
+  for (const [key, value] of Object.entries(req.body)) {
+    if (!PATCH_WHITELIST.has(key)) continue;
+    fields.push(`${key} = ?`);
+    values.push(value === "" ? null : value);  // treat empty string as null
+  }
+
+  if (fields.length === 0) {
+    return res.status(400).json({ error: "No valid fields to update" });
+  }
+
+  // Extra validation when updating status
+  const incomingStatus = req.body.status;
+  if (
+    incomingStatus !== undefined &&
+    !["uploaded", "calling", "screened", "shortlisted", "rejected"].includes(incomingStatus)
+  ) {
+    return res.status(400).json({ error: "Invalid status value" });
+  }
+
+  try {
+    values.push(id);
+    await run(
+      `UPDATE candidates SET ${fields.join(", ")} WHERE id = ?`,
+      values
+    );
+    console.log(`✏️  Updated candidate ${id}: ${fields.join(", ")}`);
+
+    const updated = await getOne("SELECT * FROM candidates WHERE id = ?", [id]);
+    res.json(mapCandidate(updated));
+  } catch (err) {
+    console.error("PATCH /api/candidates/:id error:", err);
+    res.status(500).json({ error: "Failed to update candidate" });
+  }
+});
+
+module.exports = router;
