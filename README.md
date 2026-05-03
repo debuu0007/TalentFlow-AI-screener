@@ -4,6 +4,8 @@ TalentFlow is a small full-stack app for **automated first-round phone screening
 
 This document focuses on **what the code actually does** and how the pieces connect.
 
+![Uploading Screenshot 2026-05-03 at 11.31.07 PM.png…]()
+
 ---
 
 ## High-level architecture
