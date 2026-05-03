@@ -34,9 +34,15 @@ export default function App() {
   const handleCallTrigger = async (id) => {
     try {
       const res = await fetch(`/api/candidates/${id}/call`, { method: "POST" });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        alert(`Failed to initiate call: ${data.error || "Unknown error"}`);
+        const detail =
+          data.details != null
+            ? `\n\n${JSON.stringify(data.details, null, 2).slice(0, 1500)}`
+            : "";
+        alert(
+          `Failed to initiate call:\n${data.error || res.statusText || "Unknown error"}${detail}`
+        );
         return;
       }
       // Optimistically update status in UI

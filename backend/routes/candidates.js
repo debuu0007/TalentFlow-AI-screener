@@ -2,6 +2,29 @@ const express = require("express");
 const router = express.Router();
 const fetch = require("node-fetch");
 const { getAll, getOne, run } = require("../db");
+const { syncCallingCandidatesFromBolna } = require("../bolnaSync");
+
+/** Avoid `Bearer Bearer …` if the key was pasted with a Bearer prefix. */
+function normalizeBolnaApiKey(raw) {
+  if (!raw || typeof raw !== "string") return "";
+  let t = raw.trim();
+  if (/^bearer\s+/i.test(t)) t = t.replace(/^bearer\s+/i, "").trim();
+  return t;
+}
+
+/** E.164-friendly: strip spaces/dashes/parens Bolna may reject. */
+function normalizeRecipientPhone(phone) {
+  if (!phone || typeof phone !== "string") return "";
+  return phone.replace(/[\s\-.()]/g, "");
+}
+
+function bolnaUserFacingMessage(bolnaData) {
+  if (!bolnaData || typeof bolnaData !== "object") return null;
+  if (typeof bolnaData.message === "string" && bolnaData.message.trim()) {
+    return bolnaData.message.trim();
+  }
+  return null;
+}
 
 // Helper: map integer fields to booleans for API response
 function mapCandidate(row) {
@@ -18,6 +41,9 @@ function mapCandidate(row) {
 // GET /api/candidates — all candidates ordered by created_at DESC
 router.get("/", async (req, res) => {
   try {
+    await syncCallingCandidatesFromBolna().catch((e) =>
+      console.warn("syncCallingCandidatesFromBolna:", e.message)
+    );
     const rows = await getAll("SELECT * FROM candidates ORDER BY created_at DESC");
     res.json(rows.map(mapCandidate));
   } catch (err) {
@@ -61,31 +87,69 @@ router.post("/:id/call", async (req, res) => {
   await run("UPDATE candidates SET status = 'calling' WHERE id = ?", [id]);
 
   try {
+    const apiKey = normalizeBolnaApiKey(process.env.BOLNA_API_KEY);
+    const agentId = process.env.BOLNA_AGENT_ID?.trim();
+    if (!apiKey || !agentId) {
+      await run("UPDATE candidates SET status = 'uploaded' WHERE id = ?", [id]);
+      return res.status(500).json({
+        error: "Server missing BOLNA_API_KEY or BOLNA_AGENT_ID",
+        hint: "Use backend/.env and start the server from backend/ or rely on dotenv path fix (loads backend/.env next to index.js).",
+      });
+    }
+
+    const recipientPhone = normalizeRecipientPhone(candidate.phone);
+    if (!recipientPhone || !recipientPhone.startsWith("+")) {
+      await run("UPDATE candidates SET status = 'uploaded' WHERE id = ?", [id]);
+      return res.status(400).json({
+        error: "Phone must be E.164 with country code (e.g. +919876543210)",
+        phone: candidate.phone,
+      });
+    }
+
+    const payload = {
+      agent_id: agentId,
+      recipient_phone_number: recipientPhone,
+      user_data: {
+        candidate_name: candidate.name,
+      },
+    };
+    if (process.env.BOLNA_FROM_PHONE_NUMBER?.trim()) {
+      payload.from_phone_number = process.env.BOLNA_FROM_PHONE_NUMBER.trim();
+    }
+    // API calls are often blocked outside agent "calling hours" unless bypassed (dashboard test calls may still work).
+    if (process.env.BOLNA_BYPASS_GUARDRAILS !== "false") {
+      payload.bypass_call_guardrails = true;
+    }
+
     // 3. Call Bolna API
     const response = await fetch("https://api.bolna.ai/call", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${process.env.BOLNA_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        agent_id: process.env.BOLNA_AGENT_ID,
-        recipient_phone_number: candidate.phone,
-        user_data: {
-          candidate_name: candidate.name,
-        },
-      }),
+      body: JSON.stringify(payload),
     });
 
-    const bolnaData = await response.json();
+    const rawBody = await response.text();
+    let bolnaData = {};
+    if (rawBody) {
+      try {
+        bolnaData = JSON.parse(rawBody);
+      } catch {
+        bolnaData = { parse_error: true, raw: rawBody.slice(0, 500) };
+      }
+    }
     console.log("Bolna API full response:", JSON.stringify(bolnaData, null, 2));
 
     if (!response.ok) {
-      console.error("❌ Bolna API returned error status:", response.status);
+      const bolnaMsg = bolnaUserFacingMessage(bolnaData);
+      console.error("❌ Bolna API returned error status:", response.status, bolnaMsg || "");
       await run("UPDATE candidates SET status = 'uploaded' WHERE id = ?", [id]);
       return res.status(502).json({
-        error: "Bolna API call failed",
+        error: bolnaMsg ? `Bolna API call failed: ${bolnaMsg}` : "Bolna API call failed",
         details: bolnaData,
+        bolna_http_status: response.status,
       });
     }
 
@@ -96,6 +160,18 @@ router.post("/:id/call", async (req, res) => {
                 || null;
 
     console.log("📌 callId extracted:", callId);
+
+    if (!callId) {
+      const bolnaMsg = bolnaUserFacingMessage(bolnaData);
+      console.error("❌ Bolna OK response but no execution_id:", JSON.stringify(bolnaData));
+      await run("UPDATE candidates SET status = 'uploaded' WHERE id = ?", [id]);
+      return res.status(502).json({
+        error: bolnaMsg
+          ? `Bolna API call failed: ${bolnaMsg}`
+          : "Bolna did not return an execution id (check agent_id and API response)",
+        details: bolnaData,
+      });
+    }
 
     // Save callId + status to DB — awaited explicitly so it always completes
     try {
@@ -119,7 +195,16 @@ router.post("/:id/call", async (req, res) => {
     console.error("POST /api/candidates/:id/call error:", err);
     // Revert status on error
     await run("UPDATE candidates SET status = 'uploaded' WHERE id = ?", [id]).catch(() => {});
-    res.status(500).json({ error: "Failed to initiate call", details: err.message });
+    const network =
+      err.code === "ENOTFOUND" ||
+      err.code === "ECONNREFUSED" ||
+      (err.message && /fetch|network|getaddrinfo/i.test(err.message));
+    res.status(network ? 503 : 500).json({
+      error: network
+        ? "Cannot reach Bolna (network/DNS). Confirm you can reach https://api.bolna.ai from this machine."
+        : "Failed to initiate call",
+      details: err.message,
+    });
   }
 });
 

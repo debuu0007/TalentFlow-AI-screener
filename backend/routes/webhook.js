@@ -1,6 +1,68 @@
 const express = require("express");
 const router = express.Router();
-const { getOne, run } = require("../db");
+const { getOne, getAll, run } = require("../db");
+const { applyScreeningData } = require("../screeningUpdate");
+
+/** Match Bolna: ratings land after `completed`; `call-disconnected` is still upstream of extraction. */
+const SUCCESS_SCREENED = new Set(["completed", "stopped"]);
+const FAILURE_TERMINAL = new Set([
+  "failed",
+  "no-answer",
+  "busy",
+  "canceled",
+  "error",
+  "balance-low",
+]);
+
+function extractWebhookExecutionId(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload;
+  return (
+    p.id ||
+    p.execution_id ||
+    p.executionId ||
+    p.call_id ||
+    p.callId ||
+    (p.data && (p.data.id || p.data.execution_id || p.data.call_id)) ||
+    null
+  );
+}
+
+function payloadStatus(payload) {
+  return (
+    payload.smart_status ||
+    payload.status ||
+    payload.call_status ||
+    payload.execution_status ||
+    (payload.data && (payload.data.smart_status || payload.data.status)) ||
+    null
+  );
+}
+
+function hasExtractedPayload(payload) {
+  const ed = payload.extracted_data;
+  if (ed == null || ed === "") return false;
+  if (typeof ed === "string") return ed.trim().length > 0;
+  if (typeof ed === "object") return true;
+  return false;
+}
+
+function isIntermediateOnly(payload) {
+  if (hasExtractedPayload(payload)) return false;
+  const st = payloadStatus(payload);
+  if (!st) return true;
+  const stl = String(st).toLowerCase().trim();
+  const intermediate = new Set([
+    "scheduled",
+    "queued",
+    "rescheduled",
+    "initiated",
+    "ringing",
+    "in-progress",
+    "call-disconnected",
+  ]);
+  return intermediate.has(stl);
+}
 
 // POST /api/webhook — receives Bolna call results
 router.post("/", async (req, res) => {
@@ -8,34 +70,41 @@ router.post("/", async (req, res) => {
   console.log("Payload:", JSON.stringify(req.body, null, 2));
 
   const payload = req.body;
+  const call_id = extractWebhookExecutionId(payload);
 
-  // Guard: skip intermediate webhooks (ringing, in-progress, etc.)
-  // Only process the final webhook that contains extracted_data
-  if (!payload.extracted_data) {
-    console.log("⏭️  Intermediate webhook (no extracted_data yet), skipping");
+  if (!call_id) {
+    console.log("⚠️  No execution / call id found in payload, ignoring");
+    return res.status(200).json({ ok: true });
+  }
+
+  if (isIntermediateOnly(payload)) {
+    console.log("⏭️  Intermediate webhook, skipping (no extraction yet)");
     return res.status(200).json({ received: true });
   }
 
-  // Extract call ID — Bolna sends it in payload.id
-  const call_id = payload.id || payload.call_id || null;
-  if (!call_id) {
-    console.log("⚠️  No call id found in payload, ignoring");
-    return res.status(200).json({ ok: true });
-  }
-  console.log(`✅ Processing final webhook for call ID: ${call_id}`);
+  const stRaw = payloadStatus(payload);
+  const st = stRaw ? String(stRaw).toLowerCase().trim() : "";
+  const terminalFail = st && FAILURE_TERMINAL.has(st);
+  const terminalScreened = st && SUCCESS_SCREENED.has(st);
+  const shouldFinalize =
+    hasExtractedPayload(payload) || terminalScreened || terminalFail;
 
-  // PROBLEM 3 — candidate lookup with clear logging on miss
+  if (!shouldFinalize) {
+    console.log("⏭️  Webhook not final (no extraction, not a terminal status we handle), skipping");
+    return res.status(200).json({ received: true });
+  }
+
+  console.log(`✅ Processing webhook for call ID: ${call_id} (status=${stRaw || "n/a"})`);
+
   console.log(`🔍 Looking up candidate with bolna_call_id: ${call_id}`);
   let candidate = await getOne(
-    "SELECT * FROM candidates WHERE bolna_call_id = ?",
+    "SELECT * FROM candidates WHERE bolna_call_id = ? COLLATE NOCASE",
     [call_id]
   );
 
   if (!candidate) {
     console.log(`⚠️ No match for call_id: ${call_id}`);
     console.log("ℹ️  Stored bolna_call_ids in DB:");
-    // Log all stored call IDs so we can diff and debug the mismatch
-    const { getAll } = require("../db");
     const all = await getAll("SELECT id, name, bolna_call_id FROM candidates");
     all.forEach((r) =>
       console.log(`   candidate ${r.id} (${r.name}) → bolna_call_id: ${r.bolna_call_id}`)
@@ -44,7 +113,22 @@ router.post("/", async (req, res) => {
   }
   console.log(`✅ Found candidate: ${candidate.name} (id: ${candidate.id})`);
 
-  // Parse extracted_data (may be a JSON string or already an object)
+  if (terminalFail) {
+    const note = `Call ended: ${stRaw || st}${payload.error_message ? ` — ${payload.error_message}` : ""}`;
+    try {
+      const prev = await getOne("SELECT notes FROM candidates WHERE id = ?", [candidate.id]);
+      const merged = prev?.notes ? `${prev.notes}\n${note}` : note;
+      await run(
+        "UPDATE candidates SET status = 'uploaded', bolna_call_id = NULL, notes = ? WHERE id = ?",
+        [merged, candidate.id]
+      );
+      console.log(`✅ Webhook: candidate ${candidate.id} → uploaded (${st})`);
+    } catch (err) {
+      console.error("❌ Failed terminal-fail update:", err.message);
+    }
+    return res.status(200).json({ ok: true });
+  }
+
   let data = payload.extracted_data;
   if (typeof data === "string") {
     try {
@@ -56,64 +140,20 @@ router.post("/", async (req, res) => {
     }
   }
   if (!data || typeof data !== "object") {
-    console.log("⚠️  extracted_data is missing or invalid, using empty object");
     data = {};
   }
   console.log("📊 Extracted data:", JSON.stringify(data, null, 2));
 
-  // Helper: boolean / truthy → SQLite integer
-  const boolToInt = (val) => {
-    if (val === true  || val === 1 || val === "true"  || val === "yes") return 1;
-    if (val === false || val === 0 || val === "false" || val === "no")  return 0;
-    return null;
-  };
-
-  // Update candidate row with all extracted fields
-  const screened_at = new Date().toISOString();
+  const transcript = payload.transcript || null;
 
   try {
-    await run(
-      `UPDATE candidates SET
-        status = 'screened',
-        screened_at = ?,
-        years_of_experience = ?,
-        recent_role = ?,
-        skill_rating = ?,
-        notice_period = ?,
-        notice_flexible = ?,
-        expected_ctc = ?,
-        location_comfortable = ?,
-        call_completed = ?,
-        candidate_available = ?,
-        fit_score = ?,
-        recommendation = ?,
-        notes = ?,
-        transcript = ?
-      WHERE id = ?`,
-      [
-        screened_at,
-        data.years_of_experience !== undefined ? data.years_of_experience : null,
-        data.recent_role || null,
-        data.skill_rating !== undefined ? data.skill_rating : null,
-        data.notice_period || null,
-        boolToInt(data.notice_flexible),
-        data.expected_ctc || null,
-        boolToInt(data.location_comfortable),
-        boolToInt(data.call_completed),
-        boolToInt(data.candidate_available),
-        data.fit_score !== undefined ? data.fit_score : null,
-        data.recommendation || null,
-        data.notes || null,
-        payload.transcript || null,
-        candidate.id,
-      ]
-    );
-
+    await applyScreeningData(candidate.id, data, transcript);
     console.log(`✅ Updated candidate to screened`);
-    console.log(`✅ Found candidate: ${candidate.name} — Fit Score: ${data.fit_score} | Recommendation: ${data.recommendation}`);
+    console.log(
+      `✅ Found candidate: ${candidate.name} — Fit Score: ${data.fit_score} | Recommendation: ${data.recommendation}`
+    );
   } catch (err) {
     console.error("❌ Failed to update candidate after webhook:", err.message);
-    // Return 200 so Bolna doesn't retry infinitely
     return res.status(200).json({ ok: true, warning: "DB update failed" });
   }
 
