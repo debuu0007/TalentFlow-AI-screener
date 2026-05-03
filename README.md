@@ -4,7 +4,8 @@ TalentFlow is a small full-stack app for **automated first-round phone screening
 
 This document focuses on **what the code actually does** and how the pieces connect.
 
-![Uploading Screenshot 2026-05-03 at 11.31.07 PM.png…]()
+<img width="1469" height="797" alt="Screenshot 2026-05-03 at 11 31 07 PM" src="https://github.com/user-attachments/assets/3436a48b-a8e1-4eec-82ab-65a6d443d58e" />
+
 
 ---
 
